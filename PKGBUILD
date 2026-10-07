@@ -30,7 +30,7 @@
 #
 pkgbase=linux-lrcpc
 pkgver=7.2.9
-pkgrel=1
+pkgrel=2
 pkgdesc='Linux with RCpc and LSE instruction emulation for CPUs without them'
 url='https://github.com/dixyes-digital-wastes/linux'
 arch=(

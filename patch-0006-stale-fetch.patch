@@ -1,4 +1,4 @@
-From 094eeb9bdee3296398fbfa10868832614123cd06 Mon Sep 17 00:00:00 2001
+From 41bc6e9942ff91b0577101218d291df6b6c08669 Mon Sep 17 00:00:00 2001
 From: Yun Dou <dixyes@gmail.com>
 Date: Wed, 7 Oct 2026 15:41:08 +0000
 Subject: [PATCH 6/6] arm64: Run the site again for an instruction fetched
@@ -35,8 +35,8 @@ own run 4.6e9 loads in ten seconds with the rewrite on, every site is
 rewritten, and one stale fetch is answered this way; without this they are
 killed by the SIGILL, which is what the host does.
 
-Assisted-by: dsh:deepseek-flash
-(cherry picked from commit 7a6378148baea26b534252a8d5899ed9b1a49732)
+Assisted-by: dsh:DeepSeek-V4.1-Flash
+(cherry picked from commit 3c6c08e5d61b75a50f5e9838492d9b0bd0cd68f3)
 ---
  arch/arm64/include/asm/traps.h     |  1 +
  arch/arm64/kernel/lse_block_code.h |  1 +

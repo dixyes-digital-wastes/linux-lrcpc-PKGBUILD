@@ -1,0 +1,198 @@
+From 094eeb9bdee3296398fbfa10868832614123cd06 Mon Sep 17 00:00:00 2001
+From: Yun Dou <dixyes@gmail.com>
+Date: Wed, 7 Oct 2026 15:41:08 +0000
+Subject: [PATCH 6/6] arm64: Run the site again for an instruction fetched
+ stale
+
+A rewrite puts an instruction at the site that cannot trap, and a
+processor that still has the one that was there before in its instruction
+cache runs that one, so the exception it takes is not for what the site
+holds now. The handler decodes the instruction from memory, where it finds
+what the rewrite put there, neither emulation claims it, and the task is
+given a SIGILL for an instruction that cannot have caused one: a node
+build on a machine without FEAT_LRCPC dies this way within seconds of the
+rewrite being turned on.
+
+What such a trap means is known, then: this processor ran a line that is
+no longer what the site holds. That line is dropped here with the user
+address it was fetched from, and the instruction is left to be fetched and
+run again, which is what the task would have done had its line been up to
+date. The two emulations recognise the words their rewrites write, which
+are an acquire load and a branch, and both are base ARMv8, so a processor
+cannot have been stopped by one of them and nothing else is taken for one.
+
+No order of the write and of the invalidation of the other processors
+closes this: the store is visible to the memory the handler reads at once,
+while the line another processor has is dropped some time later. What is
+dropped is counted, so that a run of the whole thing says whether this way
+through was taken at all.
+
+The emulation of the atomics needs the same, since a site that a block
+rewrite has replaced with a branch is read back the same way.
+
+In a KVM guest of the same machine, four processors on 64 sites of their
+own run 4.6e9 loads in ten seconds with the rewrite on, every site is
+rewritten, and one stale fetch is answered this way; without this they are
+killed by the SIGILL, which is what the host does.
+
+Assisted-by: dsh:deepseek-flash
+(cherry picked from commit 7a6378148baea26b534252a8d5899ed9b1a49732)
+---
+ arch/arm64/include/asm/traps.h     |  1 +
+ arch/arm64/kernel/lse_block_code.h |  1 +
+ arch/arm64/kernel/lse_emul.c       | 18 +++++++++++++++++-
+ arch/arm64/kernel/rcpc_emul.c      | 16 +++++++++++++++-
+ arch/arm64/kernel/undef_patch.c    | 16 +++++++++++++++-
+ 5 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/include/asm/traps.h b/arch/arm64/include/asm/traps.h
+index 091a296841d8..a3c0ae1fca31 100644
+--- a/arch/arm64/include/asm/traps.h
++++ b/arch/arm64/include/asm/traps.h
+@@ -55,6 +55,7 @@ extern bool undef_unaligned_ok;
+ bool undef_aligned(u32 insn, unsigned long addr);
+ void undef_fault(unsigned long addr, unsigned long flags);
+ bool undef_patch_text(struct pt_regs *regs, u32 insn, u32 replacement);
++void undef_run_again(struct pt_regs *regs);
+ 
+ void force_signal_inject(int signal, int code, unsigned long address, unsigned long err);
+ void arm64_notify_segfault(unsigned long addr);
+diff --git a/arch/arm64/kernel/lse_block_code.h b/arch/arm64/kernel/lse_block_code.h
+index 1c218c2bda3b..c13a8d03d251 100644
+--- a/arch/arm64/kernel/lse_block_code.h
++++ b/arch/arm64/kernel/lse_block_code.h
+@@ -21,6 +21,7 @@
+ #define LSE_STP_PRE	0xa9bf03e0	/* stp x0, x0, [sp, #-16]! */
+ #define LSE_LDP_POST	0xa8c103e0	/* ldp x0, x0, [sp], #16 */
+ #define LSE_B		0x14000000	/* b 0 */
++#define LSE_B_MASK	0xfc000000	/* b, and not bl or b.cond */
+ #define LSE_CBNZ_W	0x35000000	/* cbnz w0, 0 */
+ #define LSE_CBNZ_X	0xb5000000	/* cbnz x0, 0 */
+ #define LSE_DMB_ISH	0xd5033bbf	/* dmb ish */
+diff --git a/arch/arm64/kernel/lse_emul.c b/arch/arm64/kernel/lse_emul.c
+index c05ef68fef34..fe8646438bc2 100644
+--- a/arch/arm64/kernel/lse_emul.c
++++ b/arch/arm64/kernel/lse_emul.c
+@@ -96,6 +96,7 @@ static void lse_block_try(struct pt_regs *regs, const struct lse_insn *lse,
+ 
+ static atomic_long_t lse_emul_traps;
+ static atomic_long_t lse_emul_blocks;
++static atomic_long_t lse_emul_stale;
+ static atomic_long_t lse_sp_zero;
+ static atomic_long_t lse_sp_misaligned;
+ static atomic_long_t lse_sp_unwritable;
+@@ -474,8 +475,22 @@ bool try_emulate_lse(struct pt_regs *regs, u32 insn)
+ 	if (compat_user_mode(regs))
+ 		return false;
+ 
+-	if (!lse_decode(insn, &lse))
++	if (!lse_decode(insn, &lse)) {
++		/*
++		 * The branch a block rewrite puts at a site, which cannot trap:
++		 * this processor ran the operation that was there before, and
++		 * what it ran is not what the site holds now
++		 */
++		if ((insn & LSE_B_MASK) == LSE_B) {
++			atomic_long_inc(&lse_emul_traps);
++			atomic_long_inc(&lse_emul_stale);
++			undef_run_again(regs);
++
++			return true;
++		}
++
+ 		return false;
++	}
+ 
+ 	atomic_long_inc(&lse_emul_traps);
+ 
+@@ -551,6 +566,7 @@ static int lse_emul_stats_show(struct seq_file *m, void *unused)
+ 	seq_printf(m, "sp_unwritable %lu\n",
+ 		   atomic_long_read(&lse_sp_unwritable));
+ 	seq_printf(m, "blocks %lu\n", atomic_long_read(&lse_emul_blocks));
++	seq_printf(m, "stale %lu\n", atomic_long_read(&lse_emul_stale));
+ 	seq_printf(m, "block_faults %lu\n", lse_block_fault_count());
+ 
+ 	return 0;
+diff --git a/arch/arm64/kernel/rcpc_emul.c b/arch/arm64/kernel/rcpc_emul.c
+index f14d738d2687..3170384f1957 100644
+--- a/arch/arm64/kernel/rcpc_emul.c
++++ b/arch/arm64/kernel/rcpc_emul.c
+@@ -60,6 +60,7 @@ core_param(rcpc_rewrite, rcpc_rewrite_enabled, bool, 0644);
+ 
+ static atomic_long_t rcpc_emul_traps;
+ static atomic_long_t rcpc_emul_rewrites;
++static atomic_long_t rcpc_emul_stale;
+ 
+ /* The unscaled form's imm9, bits [20:12], sign extended */
+ static s64 rcpc_imm9(u32 insn)
+@@ -140,8 +141,20 @@ bool try_emulate_rcpc(struct pt_regs *regs, u32 insn)
+ 		addr = rcpc_base(regs, insn);
+ 	else if ((insn & RCPC_LDAPUR_MASK) == RCPC_LDAPUR_VALUE)
+ 		addr = rcpc_base(regs, insn) + rcpc_imm9(insn);
+-	else
++	else if ((insn & RCPC_LDAPR_MASK) == RCPC_LDAR_VALUE) {
++		/*
++		 * The acquire load a rewrite puts at a site, which cannot trap:
++		 * this processor ran the load that was there before, and what
++		 * it ran is not what the site holds now
++		 */
++		atomic_long_inc(&rcpc_emul_traps);
++		atomic_long_inc(&rcpc_emul_stale);
++		undef_run_again(regs);
++
++		return true;
++	} else {
+ 		return false;
++	}
+ 
+ 	atomic_long_inc(&rcpc_emul_traps);
+ 
+@@ -187,6 +200,7 @@ static int rcpc_emul_stats_show(struct seq_file *m, void *unused)
+ {
+ 	seq_printf(m, "traps %lu\n", atomic_long_read(&rcpc_emul_traps));
+ 	seq_printf(m, "rewrites %lu\n", atomic_long_read(&rcpc_emul_rewrites));
++	seq_printf(m, "stale %lu\n", atomic_long_read(&rcpc_emul_stale));
+ 
+ 	return 0;
+ }
+diff --git a/arch/arm64/kernel/undef_patch.c b/arch/arm64/kernel/undef_patch.c
+index 74768b45d076..ff4032b3e0bb 100644
+--- a/arch/arm64/kernel/undef_patch.c
++++ b/arch/arm64/kernel/undef_patch.c
+@@ -6,7 +6,8 @@
+  * An emulation that puts something else in the place of the instruction
+  * writes into the task's own text, and one that carries the instruction out
+  * has to report the faults it cannot resolve the way the instruction would
+- * have
++ * have. A processor that ran a line of that text which is no longer what the
++ * site holds is given the site again
+  */
+ 
+ #include <linux/highmem.h>
+@@ -16,6 +17,7 @@
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/cpufeature.h>
++#include <asm/insn-def.h>
+ #include <asm/ptrace.h>
+ #include <asm/sysreg.h>
+ #include <asm/traps.h>
+@@ -133,6 +135,18 @@ bool undef_patch_text(struct pt_regs *regs, u32 insn, u32 replacement)
+ 	return patched;
+ }
+ 
++/*
++ * Leaves the site to run again for a processor whose fetch of it was stale: the
++ * line it ran is not what the site holds now, so that line is dropped here and
++ * the instruction is left to be fetched again
++ */
++void undef_run_again(struct pt_regs *regs)
++{
++	unsigned long pc = instruction_pointer(regs);
++
++	caches_clean_inval_user_pou(pc, pc + AARCH64_INSN_SIZE);
++}
++
+ static int __init undef_patch_init(void)
+ {
+ 	u64 mmfr2 = read_sanitised_ftr_reg(SYS_ID_AA64MMFR2_EL1);

@@ -1,7 +1,7 @@
 From 69ab2c932dbd9f7bb14bbfa67528bfc62168d527 Mon Sep 17 00:00:00 2001
 From: Yun Dou <dixyes@gmail.com>
 Date: Wed, 7 Oct 2026 11:27:07 +0800
-Subject: [PATCH 1/5] arm64: Add emulation of the RCpc acquire loads
+Subject: [PATCH 1/6] arm64: Add emulation of the RCpc acquire loads
 
 A CPU without FEAT_LRCPC takes an undefined instruction exception on the
 LDAPR and LDAPUR families, which a binary built for a newer target can

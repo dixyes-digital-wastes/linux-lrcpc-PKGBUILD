@@ -19,7 +19,7 @@ git -C "$tree" format-patch "$base"..lse-emul-backport-v7.2 -o "$here" --no-sign
 set -- "$here"/000*.patch
 names=(patch-0001-RCpc-loads.patch patch-0002-RCpc-rewrite.patch \
        patch-0003-shared-primitives.patch patch-0004-LSE-emulation.patch \
-       patch-0005-LSE-blocks.patch)
+       patch-0005-LSE-blocks.patch patch-0006-stale-fetch.patch)
 for i in "${!names[@]}"; do
 	mv -f "$1" "$here/${names[$i]}"
 	shift

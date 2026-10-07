@@ -1,7 +1,7 @@
 From 3fa098286ad95e9f3419c6e94d3518835d7e6f66 Mon Sep 17 00:00:00 2001
 From: Yun Dou <dixyes@gmail.com>
 Date: Wed, 7 Oct 2026 12:18:42 +0800
-Subject: [PATCH 2/5] arm64: Replace the RCpc acquire loads in place when
+Subject: [PATCH 2/6] arm64: Replace the RCpc acquire loads in place when
  enabled
 
 Making the load by hand costs an exception every time it runs, which a

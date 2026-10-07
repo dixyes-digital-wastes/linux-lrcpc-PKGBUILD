@@ -1,7 +1,7 @@
 From 3cc22ea8f0bbc4b1d1561c973c282374dfbe4870 Mon Sep 17 00:00:00 2001
 From: Yun Dou <dixyes@gmail.com>
 Date: Wed, 7 Oct 2026 15:39:22 +0800
-Subject: [PATCH 5/5] arm64: Send a site that keeps trapping to a block
+Subject: [PATCH 5/6] arm64: Send a site that keeps trapping to a block
 
 A site that runs an atomic operation in a loop pays an exception every
 time, which is a million of them to boot a distribution. A site that has

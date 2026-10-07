@@ -13,6 +13,8 @@ The kernel, the emulation and the patch series come from
 this repository are those five commits backported onto the 7.2 series, which is
 what the userspace kernel is based on.
 
+![](screenshot.png)
+
 ## License
 
 Two licenses, and it is worth not mixing them up:

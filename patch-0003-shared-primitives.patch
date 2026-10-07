@@ -1,0 +1,423 @@
+From 2e946d3dfc6b46b5173643f66e5eb221173a3d26 Mon Sep 17 00:00:00 2001
+From: Yun Dou <dixyes@gmail.com>
+Date: Wed, 7 Oct 2026 13:32:06 +0800
+Subject: [PATCH 3/5] arm64: Share what the emulations of the undefined
+ instructions need
+
+The emulation of the RCpc acquire loads replaces the instruction a task
+was stopped on, reports a fault it cannot resolve at the address the
+instruction would have used, and answers for the alignment the
+architecture requires of the access. Emulating the LSE atomics needs the
+same three things, so they are moved into a file of their own.
+
+The RCpc loads behave exactly as before: the same page is written the same
+way, the same signal is delivered for the same address, and the feature
+register the alignment is read from is still read once at boot.
+
+Assisted-by: dsh:DeepSeek-V4.1-Flash
+(cherry picked from commit 423ebea2e866187cb383b4a065aabd63e77f30cd)
+---
+ arch/arm64/Kconfig              |   4 +
+ arch/arm64/include/asm/traps.h  |   6 ++
+ arch/arm64/kernel/Makefile      |   1 +
+ arch/arm64/kernel/rcpc_emul.c   | 120 +-------------------------
+ arch/arm64/kernel/undef_patch.c | 146 ++++++++++++++++++++++++++++++++
+ 5 files changed, 161 insertions(+), 116 deletions(-)
+ create mode 100644 arch/arm64/kernel/undef_patch.c
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 862814ebe21f..a36e6f418478 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1835,9 +1835,13 @@ menuconfig ARMV8_DEPRECATED
+ 
+ 	  If unsure, say Y
+ 
++config ARM64_UNDEF_EMULATION
++	bool
++
+ config ARM64_RCPC_EMULATION
+ 	bool "Emulate the RCpc acquire loads (FEAT_LRCPC)"
+ 	default y
++	select ARM64_UNDEF_EMULATION
+ 	help
+ 	  A CPU without FEAT_LRCPC takes an undefined instruction exception
+ 	  on the LDAPR and LDAPUR families of acquire loads, which a binary
+diff --git a/arch/arm64/include/asm/traps.h b/arch/arm64/include/asm/traps.h
+index 8f64aef35208..057b9721b71a 100644
+--- a/arch/arm64/include/asm/traps.h
++++ b/arch/arm64/include/asm/traps.h
+@@ -31,6 +31,12 @@ static inline bool try_emulate_rcpc(struct pt_regs *regs, u32 insn)
+ }
+ #endif /* CONFIG_ARM64_RCPC_EMULATION */
+ 
++/* shared between the emulations of the undefined instructions at EL0 */
++extern bool undef_unaligned_ok;
++bool undef_aligned(u32 insn, unsigned long addr);
++void undef_fault(unsigned long addr, unsigned long flags);
++bool undef_patch_text(struct pt_regs *regs, u32 insn, u32 replacement);
++
+ void force_signal_inject(int signal, int code, unsigned long address, unsigned long err);
+ void arm64_notify_segfault(unsigned long addr);
+ void arm64_force_sig_fault(int signo, int code, unsigned long far, const char *str);
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 0c5e4278a6cf..994651e8f93a 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -52,6 +52,7 @@ obj-$(CONFIG_KGDB)			+= kgdb.o
+ obj-$(CONFIG_EFI)			+= efi.o efi-rt-wrapper.o
+ obj-$(CONFIG_PCI)			+= pci.o
+ obj-$(CONFIG_ARMV8_DEPRECATED)		+= armv8_deprecated.o
++obj-$(CONFIG_ARM64_UNDEF_EMULATION)	+= undef_patch.o
+ obj-$(CONFIG_ARM64_RCPC_EMULATION)	+= rcpc_emul.o
+ obj-$(CONFIG_ACPI)			+= acpi.o
+ obj-$(CONFIG_ACPI_NUMA)			+= acpi_numa.o
+diff --git a/arch/arm64/kernel/rcpc_emul.c b/arch/arm64/kernel/rcpc_emul.c
+index f3d2e16c9d0d..f14d738d2687 100644
+--- a/arch/arm64/kernel/rcpc_emul.c
++++ b/arch/arm64/kernel/rcpc_emul.c
+@@ -13,18 +13,15 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/debugfs.h>
+-#include <linux/highmem.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
++#include <linux/moduleparam.h>
+ #include <linux/seq_file.h>
+ #include <linux/uaccess.h>
+ 
+ #include <asm/barrier.h>
+-#include <asm/cacheflush.h>
+-#include <asm/cpufeature.h>
+ #include <asm/insn-def.h>
+ #include <asm/ptrace.h>
+-#include <asm/sysreg.h>
+ #include <asm/traps.h>
+ 
+ /*
+@@ -61,14 +58,6 @@
+ static bool rcpc_rewrite_enabled;
+ core_param(rcpc_rewrite, rcpc_rewrite_enabled, bool, 0644);
+ 
+-/*
+- * Whether an unaligned load of this family is allowed here, which is what
+- * ID_AA64MMFR2_EL1.AT reports: a Load-Acquire is only allowed to be unaligned
+- * where ARMv8.4-LSE, and without it the load takes an Alignment fault before
+- * any of its other behaviour is reached
+- */
+-static bool rcpc_unaligned_ok __ro_after_init;
+-
+ static atomic_long_t rcpc_emul_traps;
+ static atomic_long_t rcpc_emul_rewrites;
+ 
+@@ -86,47 +75,13 @@ static unsigned long rcpc_base(struct pt_regs *regs, u32 insn)
+ 	return rn == 31 ? regs->sp : regs->regs[rn];
+ }
+ 
+-/*
+- * Whether the address is aligned for the width of the access
+- *
+- * An acquire load is single copy atomic, and that is what requires natural
+- * alignment, where the RCpc load it would stand in for may be read at any
+- * alignment, so an unaligned one is left to the emulation
+- */
+-static bool rcpc_aligned(u32 insn, unsigned long addr)
+-{
+-	switch (RCPC_SIZE(insn)) {
+-	case 0:
+-		return true;
+-	case 1:
+-		return !(addr & 1);
+-	case 2:
+-		return !(addr & 3);
+-	default:
+-		return !(addr & 7);
+-	}
+-}
+-
+ /*
+  * Replaces the load the task was stopped on with the acquire load that does
+  * the same job, so that the next time it runs there is nothing to trap on
+- *
+- * What is written is the task's own copy of the page: a private mapping is
+- * given one first, and a shared mapping is left alone, because the change
+- * would be seen by every process that maps it. Whether this succeeds or not,
+- * the load is carried out below, so nothing depends on it but speed
+  */
+ static bool rcpc_rewrite(struct pt_regs *regs, u32 insn)
+ {
+-	unsigned long pc = instruction_pointer(regs);
+-	unsigned int gup_flags = FOLL_WRITE | FOLL_FORCE | FOLL_SPLIT_PMD;
+-	struct vm_area_struct *vma;
+-	struct folio *folio;
+-	struct page *page = NULL;
+ 	u32 replacement;
+-	void *kaddr;
+-	int locked;
+-	long ret;
+ 
+ 	if (!rcpc_rewrite_enabled)
+ 		return false;
+@@ -141,50 +96,7 @@ static bool rcpc_rewrite(struct pt_regs *regs, u32 insn)
+ 
+ 	replacement = RCPC_LDAR_VALUE | (insn & (RCPC_SIZE_MASK | RCPC_REG_MASK));
+ 
+-	mmap_read_lock(current->mm);
+-	for (;;) {
+-		vma = vma_lookup(current->mm, pc);
+-		if (!vma || !(vma->vm_flags & VM_EXEC) ||
+-		    (vma->vm_flags & VM_SHARED)) {
+-			mmap_read_unlock(current->mm);
+-			return false;
+-		}
+-
+-		locked = 1;
+-		ret = get_user_pages_remote(current->mm, pc & PAGE_MASK, 1,
+-					    gup_flags, &page, &locked);
+-		if (locked)
+-			break;
+-		/* the mapping may have been replaced while the page faulted */
+-	}
+-
+-	if (ret == 1) {
+-		folio = page_folio(page);
+-		kaddr = kmap_local_page(page);
+-		/*
+-		 * Whatever is at the site now is what runs next: anything but
+-		 * the instruction that trapped is somebody else's doing, and is
+-		 * left alone
+-		 */
+-		if (*(u32 *)(kaddr + offset_in_page(pc)) == insn) {
+-			copy_to_user_page(vma, page, pc, kaddr + offset_in_page(pc),
+-					  &replacement, sizeof(replacement));
+-			ret = 1;
+-		} else {
+-			ret = 0;
+-		}
+-		kunmap_local(kaddr);
+-	} else {
+-		folio = NULL;
+-	}
+-	mmap_read_unlock(current->mm);
+-
+-	if (folio) {
+-		set_page_dirty_lock(page);
+-		folio_put(folio);
+-	}
+-
+-	return ret == 1;
++	return undef_patch_text(regs, insn, replacement);
+ }
+ 
+ /*
+@@ -209,25 +121,6 @@ static int rcpc_load(u32 insn, unsigned long addr, u64 *value)
+ 	}
+ }
+ 
+-/*
+- * The signal the load would have taken: an address in a mapping that does not
+- * allow the read is a protection fault, and one in no mapping at all is a
+- * missing mapping
+- */
+-static void rcpc_fault(unsigned long addr)
+-{
+-	struct vm_area_struct *vma;
+-	int code = SEGV_MAPERR;
+-
+-	mmap_read_lock(current->mm);
+-	vma = vma_lookup(current->mm, untagged_addr(addr));
+-	if (vma && !(vma->vm_flags & VM_READ))
+-		code = SEGV_ACCERR;
+-	mmap_read_unlock(current->mm);
+-
+-	force_signal_inject(SIGSEGV, code, addr, 0);
+-}
+-
+ /*
+  * Performs the instruction an EL0 task was stopped on
+  *
+@@ -257,7 +150,7 @@ bool try_emulate_rcpc(struct pt_regs *regs, u32 insn)
+ 	 * the architecture refuses is not one of them: an unaligned Load-Acquire
+ 	 * takes the Alignment fault before the load is reached
+ 	 */
+-	if (!rcpc_unaligned_ok && !rcpc_aligned(insn, addr)) {
++	if (!undef_unaligned_ok && !undef_aligned(insn, addr)) {
+ 		force_signal_inject(SIGBUS, BUS_ADRALN, addr, 0);
+ 		return true;
+ 	}
+@@ -271,7 +164,7 @@ bool try_emulate_rcpc(struct pt_regs *regs, u32 insn)
+ 		 * instruction would have used, and leave the instruction where
+ 		 * it is, as a load that faulted would have
+ 		 */
+-		rcpc_fault(addr);
++		undef_fault(addr, VM_READ);
+ 		return true;
+ 	}
+ 
+@@ -317,13 +210,8 @@ DEFINE_DEBUGFS_ATTRIBUTE(rcpc_emul_rewrite_fops, rcpc_emul_rewrite_get,
+ 
+ static int __init rcpc_emul_init(void)
+ {
+-	u64 mmfr2 = read_sanitised_ftr_reg(SYS_ID_AA64MMFR2_EL1);
+ 	struct dentry *dir;
+ 
+-	rcpc_unaligned_ok =
+-		cpuid_feature_extract_unsigned_field(mmfr2,
+-						     ID_AA64MMFR2_EL1_AT_SHIFT) != 0;
+-
+ 	dir = debugfs_create_dir("rcpc_emul", NULL);
+ 	debugfs_create_file("stats", 0444, dir, NULL, &rcpc_emul_stats_fops);
+ 	debugfs_create_file("rewrite", 0644, dir, NULL, &rcpc_emul_rewrite_fops);
+diff --git a/arch/arm64/kernel/undef_patch.c b/arch/arm64/kernel/undef_patch.c
+new file mode 100644
+index 000000000000..74768b45d076
+--- /dev/null
++++ b/arch/arm64/kernel/undef_patch.c
+@@ -0,0 +1,146 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Replacing the instruction an EL0 task was stopped on, and what the
++ * emulations of the undefined instructions share
++ *
++ * An emulation that puts something else in the place of the instruction
++ * writes into the task's own text, and one that carries the instruction out
++ * has to report the faults it cannot resolve the way the instruction would
++ * have
++ */
++
++#include <linux/highmem.h>
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/uaccess.h>
++
++#include <asm/cacheflush.h>
++#include <asm/cpufeature.h>
++#include <asm/ptrace.h>
++#include <asm/sysreg.h>
++#include <asm/traps.h>
++
++/*
++ * Whether an unaligned atomic access is allowed here, which is what
++ * ID_AA64MMFR2_EL1.AT reports: without ARMv8.4-LSE, an atomic access and a
++ * non-atomic Load-Acquire or Store-Release take an Alignment fault when the
++ * address is not aligned to the size of the access
++ */
++bool undef_unaligned_ok __ro_after_init;
++
++/*
++ * Whether the access an instruction makes at this address is aligned. The
++ * size of every access that reaches here is in the two top bits, 1, 2, 4 or 8
++ * bytes
++ */
++bool undef_aligned(u32 insn, unsigned long addr)
++{
++	switch (insn >> 30) {
++	case 0:
++		return true;
++	case 1:
++		return !(addr & 1);
++	case 2:
++		return !(addr & 3);
++	default:
++		return !(addr & 7);
++	}
++}
++
++/*
++ * The signal the access would have taken: an address in a mapping that does
++ * not allow it is a protection fault, and one in no mapping at all is a
++ * missing mapping
++ *
++ * The flags are what the access needs of the mapping: a load reads, an atomic
++ * operation reads and writes
++ */
++void undef_fault(unsigned long addr, unsigned long flags)
++{
++	struct vm_area_struct *vma;
++	int code = SEGV_MAPERR;
++
++	mmap_read_lock(current->mm);
++	vma = vma_lookup(current->mm, untagged_addr(addr));
++	if (vma && (vma->vm_flags & flags) != flags)
++		code = SEGV_ACCERR;
++	mmap_read_unlock(current->mm);
++
++	force_signal_inject(SIGSEGV, code, addr, 0);
++}
++
++/*
++ * Replaces the instruction a task was stopped on with one that takes over its
++ * work, so that the next time it runs there is nothing to trap on
++ *
++ * What is written is the task's own copy of the page: a private mapping is
++ * given one first, and a shared mapping is left alone, because the change
++ * would be seen by every process that maps it. Whether the site still holds
++ * the instruction that trapped is checked first, so an instruction somebody
++ * else put there is not overwritten
++ *
++ * Whether this succeeds or not, the caller carries the instruction out, so
++ * nothing depends on it but speed
++ */
++bool undef_patch_text(struct pt_regs *regs, u32 insn, u32 replacement)
++{
++	unsigned long pc = instruction_pointer(regs);
++	unsigned int gup_flags = FOLL_WRITE | FOLL_FORCE | FOLL_SPLIT_PMD;
++	struct vm_area_struct *vma;
++	struct folio *folio;
++	struct page *page = NULL;
++	bool patched = false;
++	void *kaddr;
++	int locked;
++	long ret;
++
++	mmap_read_lock(current->mm);
++	for (;;) {
++		vma = vma_lookup(current->mm, pc);
++		if (!vma || !(vma->vm_flags & VM_EXEC) ||
++		    (vma->vm_flags & VM_SHARED)) {
++			mmap_read_unlock(current->mm);
++			return false;
++		}
++
++		locked = 1;
++		ret = get_user_pages_remote(current->mm, pc & PAGE_MASK, 1,
++					    gup_flags, &page, &locked);
++		if (locked)
++			break;
++		/* the mapping may have been replaced while the page faulted */
++	}
++
++	if (ret == 1) {
++		folio = page_folio(page);
++		kaddr = kmap_local_page(page);
++		if (*(u32 *)(kaddr + offset_in_page(pc)) == insn) {
++			copy_to_user_page(vma, page, pc, kaddr + offset_in_page(pc),
++					  &replacement, sizeof(replacement));
++			patched = true;
++		}
++		kunmap_local(kaddr);
++	} else {
++		folio = NULL;
++	}
++	mmap_read_unlock(current->mm);
++
++	if (folio) {
++		set_page_dirty_lock(page);
++		folio_put(folio);
++	}
++
++	return patched;
++}
++
++static int __init undef_patch_init(void)
++{
++	u64 mmfr2 = read_sanitised_ftr_reg(SYS_ID_AA64MMFR2_EL1);
++
++	undef_unaligned_ok =
++		cpuid_feature_extract_unsigned_field(mmfr2,
++						     ID_AA64MMFR2_EL1_AT_SHIFT) != 0;
++
++	return 0;
++}
++late_initcall(undef_patch_init);

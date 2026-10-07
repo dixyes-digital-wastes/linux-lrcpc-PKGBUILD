@@ -1,0 +1,4 @@
+# the mainline tarball makepkg downloads, the tree it builds in, and what it packs
+src/
+build/
+pkg/

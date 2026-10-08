@@ -1,0 +1,37 @@
+From 61503a03be19b092d32b03e2d87f88a853b63634 Mon Sep 17 00:00:00 2001
+From: Yun Dou <dixyes@gmail.com>
+Date: Thu, 8 Oct 2026 13:11:06 +0000
+Subject: [PATCH 8/8] arm64: Do not look for blocks where LSE is present
+
+Every block comes from a site that trapped, and an LSE instruction
+cannot trap where the machine has them, so on such a machine the hook
+has nothing to answer: it would only take the mapping lock and look the
+mapping up on every fault EL0 takes, which is where one such lock was
+waited on for over two minutes.
+
+Assisted-by: dsh:DeepSeek-V4.1-Flash
+(cherry picked from commit d1d984f59103a3ad5622a208663d187c601d1f5f)
+---
+ arch/arm64/mm/fault.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index c464ec2773b0..7e1ce9cc47de 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -984,9 +984,13 @@ void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
+ 
+ 	/*
+ 	 * A fault from the block an LSE atomic site was replaced with: the
+-	 * operation has not been made, and is made here in place of it
++	 * operation has not been made, and is made here in place of it. A
++	 * block is only ever made for a site that trapped, which an LSE
++	 * instruction cannot do where the machine has them, and looking for
++	 * one costs the mapping lock on every fault otherwise
+ 	 */
+-	if (lse_block_fault(esr, regs))
++	if (!cpus_have_final_cap(ARM64_HAS_LSE_ATOMICS) &&
++	    lse_block_fault(esr, regs))
+ 		return;
+ 
+ 	if (!inf->fn(far, esr, regs))

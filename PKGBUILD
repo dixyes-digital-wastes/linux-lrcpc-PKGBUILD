@@ -30,7 +30,7 @@
 #
 pkgbase=linux-lrcpc
 pkgver=7.2.9
-pkgrel=2
+pkgrel=3
 pkgdesc='Linux with RCpc and LSE instruction emulation for CPUs without them'
 url='https://github.com/dixyes-digital-wastes/linux'
 arch=(
@@ -68,6 +68,8 @@ source=(
   patch-0004-LSE-emulation.patch
   patch-0005-LSE-blocks.patch
   patch-0006-stale-fetch.patch
+  patch-0007-mmap-lock.patch
+  patch-0008-block-hook.patch
   config.aarch64
 )
 validpgpkeys=(
@@ -75,6 +77,8 @@ validpgpkeys=(
   647F28654894E3BD457199BE38DBBDC86092693E  # Greg Kroah-Hartman
 )
 sha256sums=('b4c5dfbe51a364a6c7f03869200f88c8e1f77403539005f14b7fc6bc91b8d8ba'
+            'SKIP'
+            'SKIP'
             'SKIP'
             'SKIP'
             'SKIP'

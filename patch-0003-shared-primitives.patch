@@ -1,7 +1,7 @@
 From 2e946d3dfc6b46b5173643f66e5eb221173a3d26 Mon Sep 17 00:00:00 2001
 From: Yun Dou <dixyes@gmail.com>
 Date: Wed, 7 Oct 2026 13:32:06 +0800
-Subject: [PATCH 3/6] arm64: Share what the emulations of the undefined
+Subject: [PATCH 3/8] arm64: Share what the emulations of the undefined
  instructions need
 
 The emulation of the RCpc acquire loads replaces the instruction a task

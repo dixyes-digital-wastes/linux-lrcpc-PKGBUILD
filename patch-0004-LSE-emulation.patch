@@ -1,7 +1,7 @@
 From f2d8c986e29e08218659980f88996bf7d9d1d547 Mon Sep 17 00:00:00 2001
 From: Yun Dou <dixyes@gmail.com>
 Date: Wed, 7 Oct 2026 13:40:16 +0800
-Subject: [PATCH 4/6] arm64: Add emulation of the LSE atomic instructions
+Subject: [PATCH 4/8] arm64: Add emulation of the LSE atomic instructions
 
 A CPU without FEAT_LSE takes an undefined instruction exception on the
 atomic memory operations, the swaps and the compare and swaps, which a

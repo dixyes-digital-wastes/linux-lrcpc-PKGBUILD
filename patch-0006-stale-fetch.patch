@@ -1,7 +1,7 @@
 From 41bc6e9942ff91b0577101218d291df6b6c08669 Mon Sep 17 00:00:00 2001
 From: Yun Dou <dixyes@gmail.com>
 Date: Wed, 7 Oct 2026 15:41:08 +0000
-Subject: [PATCH 6/6] arm64: Run the site again for an instruction fetched
+Subject: [PATCH 6/8] arm64: Run the site again for an instruction fetched
  stale
 
 A rewrite puts an instruction at the site that cannot trap, and a

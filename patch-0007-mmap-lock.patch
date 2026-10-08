@@ -1,0 +1,80 @@
+From 4f6158c819221fecd36216f74b206abebb3b5c31 Mon Sep 17 00:00:00 2001
+From: Yun Dou <dixyes@gmail.com>
+Date: Thu, 8 Oct 2026 13:11:06 +0000
+Subject: [PATCH 7/8] arm64: Take the mmap lock again when a fault gives it up
+
+get_user_pages_remote() works with the mapping lock held, and hands it
+back when the fault that makes the page writable has to wait. The caller
+learns that from the value it passes in and out: it comes back zero when
+the lock is not held, which is what a signal taken while it waited
+leaves behind.
+
+The loop here took the next round without it -- looking the mapping up
+and calling in again while saying the lock was held -- and unlocked at
+the end anyway. That leaves the mm's lock count wrong: the next caller
+that checks it is warned at, and a reader can be left waiting for an
+owner that is not there. A machine with rcpc_rewrite on was seen to do
+exactly that, with a task stuck in the block fault hook for over two
+minutes.
+
+Take it again before the next try, and stop after a few rather than
+spin. Nothing depends on the rewrite but speed: the caller carries the
+instruction out either way.
+
+Assisted-by: dsh:DeepSeek-V4.1-Flash
+(cherry picked from commit 0349bb4d97fac755be015ec1bf56a5e94fa5c2a7)
+---
+ arch/arm64/kernel/undef_patch.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/kernel/undef_patch.c b/arch/arm64/kernel/undef_patch.c
+index ff4032b3e0bb..06375dfd927c 100644
+--- a/arch/arm64/kernel/undef_patch.c
++++ b/arch/arm64/kernel/undef_patch.c
+@@ -22,6 +22,9 @@
+ #include <asm/sysreg.h>
+ #include <asm/traps.h>
+ 
++/* How many times a fault that takes the lock away is retried */
++#define UNDEF_PATCH_TRIES	8
++
+ /*
+  * Whether an unaligned atomic access is allowed here, which is what
+  * ID_AA64MMFR2_EL1.AT reports: without ARMv8.4-LSE, an atomic access and a
+@@ -94,10 +97,11 @@ bool undef_patch_text(struct pt_regs *regs, u32 insn, u32 replacement)
+ 	bool patched = false;
+ 	void *kaddr;
+ 	int locked;
++	int tries;
+ 	long ret;
+ 
+ 	mmap_read_lock(current->mm);
+-	for (;;) {
++	for (tries = 0; tries < UNDEF_PATCH_TRIES; tries++) {
+ 		vma = vma_lookup(current->mm, pc);
+ 		if (!vma || !(vma->vm_flags & VM_EXEC) ||
+ 		    (vma->vm_flags & VM_SHARED)) {
+@@ -110,7 +114,22 @@ bool undef_patch_text(struct pt_regs *regs, u32 insn, u32 replacement)
+ 					    gup_flags, &page, &locked);
+ 		if (locked)
+ 			break;
+-		/* the mapping may have been replaced while the page faulted */
++
++		/*
++		 * The lock is dropped around the fault that makes the page
++		 * writable, and a signal taken while it faults can leave it
++		 * dropped: that is what handing back unlocked as zero says.
++		 * Take it again, because the mapping above is only good
++		 * under it, and give up rather than spin if it keeps
++		 * happening
++		 */
++		mmap_read_lock(current->mm);
++	}
++
++	if (tries == UNDEF_PATCH_TRIES) {
++		mmap_read_unlock(current->mm);
++
++		return false;
+ 	}
+ 
+ 	if (ret == 1) {

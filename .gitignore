@@ -1,4 +1,7 @@
-# the mainline tarball makepkg downloads, the tree it builds in, and what it packs
-src/
-build/
-pkg/
+# What makepkg downloads and leaves behind: neither is part of the package
+# definition, and the sources and the built trees are large
+linux-*.tar.*
+*.pkg.tar.*
+/src/
+/pkg/
+/build/

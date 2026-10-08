@@ -14,15 +14,17 @@
 # What was changed, and nothing else:
 #
 #   * pkgbase is linux-lrcpc, so this can be installed next to the stock kernel
-#     instead of replacing it, and only the main package is built (no -headers,
-#     no -docs: neither is needed to boot and run)
+#     instead of replacing it; the main package and the headers package (which
+#     is what DKMS needs) are built, and -docs is not
 #   * arch is aarch64, the source is the kernel.org tarball of the release the
 #     distribution's kernel is based on, and the emulation comes in as the
 #     patch series (patch-000*.patch) instead of the Arch patch set
 #   * config.aarch64 is the config of the distribution's own linux package,
 #     extracted from its vmlinuz with scripts/extract-ikconfig; three settings
-#     are turned on below, and DEBUG_INFO is turned off to keep the build
-#     short -- that last one is the only deviation with no runtime meaning
+#     are turned on below, the hns3 driver is on as a module (the PCIe NIC of
+#     the machine this is for), and DEBUG_INFO is turned off there to keep the
+#     build short -- that last one is the only deviation with no runtime
+#     meaning, and the DEBUG_INFO choice is one olddefconfig makes again
 #   * a cross build sets CROSS_COMPILE, since this is usually built on an
 #     x86_64 box; on an aarch64 box it builds natively
 #   * htmldocs and the bpftool header generation are dropped along with the
@@ -180,8 +182,101 @@ _package() {
   rm "$modulesdir"/build
 }
 
+_package-headers() {
+  pkgdesc="Headers and scripts for building modules for the $pkgdesc kernel"
+  depends=(
+    binutils
+    glibc
+    libelf
+    libgcc
+    openssl
+    pahole
+    xxhash
+    zlib
+    zstd
+  )
+  provides=(
+    LINUX-HEADERS
+  )
+
+  cd $_srcname
+  local builddir="$pkgdir/usr/lib/modules/$(<version)/build"
+  local karch=arm64
+
+  echo "Installing build files..."
+  install -Dt "$builddir" -m644 .config Makefile Module.symvers System.map \
+    localversion.* version vmlinux
+  install -Dt "$builddir/kernel" -m644 kernel/Makefile
+  install -Dt "$builddir/arch/$karch" -m644 arch/$karch/Makefile
+  cp -t "$builddir" -a scripts
+  ln -srt "$builddir" "$builddir/scripts/gdb/vmlinux-gdb.py"
+
+  echo "Installing headers..."
+  cp -t "$builddir" -a include
+  cp -t "$builddir/arch/$karch" -a arch/$karch/include
+  install -Dt "$builddir/arch/$karch/kernel" -m644 arch/$karch/kernel/asm-offsets.s
+
+  install -Dt "$builddir/drivers/md" -m644 drivers/md/*.h
+  install -Dt "$builddir/net/mac80211" -m644 net/mac80211/*.h
+
+  # https://bugs.archlinux.org/task/13146
+  install -Dt "$builddir/drivers/media/i2c" -m644 drivers/media/i2c/msp3400-driver.h
+
+  # https://bugs.archlinux.org/task/20402
+  install -Dt "$builddir/drivers/media/usb/dvb-usb" -m644 drivers/media/usb/dvb-usb/*.h
+  install -Dt "$builddir/drivers/media/dvb-frontends" -m644 drivers/media/dvb-frontends/*.h
+  install -Dt "$builddir/drivers/media/tuners" -m644 drivers/media/tuners/*.h
+
+  # https://bugs.archlinux.org/task/71392
+  install -Dt "$builddir/drivers/iio/common/hid-sensors" -m644 drivers/iio/common/hid-sensors/*.h
+
+  echo "Installing KConfig files..."
+  find . -name 'Kconfig*' -exec install -Dm644 {} "$builddir/{}" \;
+
+  echo "Installing unstripped VDSO..."
+  make INSTALL_MOD_PATH="$pkgdir/usr" vdso_install \
+    link=  # Suppress build-id symlinks
+
+  echo "Removing unneeded architectures..."
+  local arch
+  for arch in "$builddir"/arch/*/; do
+    [[ $arch = */$karch/ ]] && continue
+    echo "Removing $(basename "$arch")"
+    rm -r "$arch"
+  done
+
+  echo "Removing broken symlinks..."
+  find -L "$builddir" -type l -printf 'Removing %P\n' -delete
+
+  echo "Removing loose objects..."
+  find "$builddir" -type f -name '*.o' -printf 'Removing %P\n' -delete
+
+  echo "Stripping build tools..."
+  local file
+  while read -rd '' file; do
+    case "$(file -Sib "$file")" in
+      application/x-sharedlib\;*)      # Libraries (.so)
+        strip -v $STRIP_SHARED "$file" ;;
+      application/x-archive\;*)        # Libraries (.a)
+        strip -v $STRIP_STATIC "$file" ;;
+      application/x-executable\;*)     # Binaries
+        strip -v $STRIP_BINARIES "$file" ;;
+      application/x-pie-executable\;*) # Relocatable binaries
+        strip -v $STRIP_SHARED "$file" ;;
+    esac
+  done < <(find "$builddir" -type f -perm -u+x ! -name vmlinux -print0)
+
+  echo "Stripping vmlinux..."
+  strip -v $STRIP_STATIC "$builddir/vmlinux"
+
+  echo "Adding symlink..."
+  mkdir -p "$pkgdir/usr/src"
+  ln -sr "$builddir" "$pkgdir/usr/src/$pkgbase"
+}
+
 pkgname=(
   "$pkgbase"
+  "$pkgbase-headers"
 )
 for _p in "${pkgname[@]}"; do
   eval "package_$_p() {
